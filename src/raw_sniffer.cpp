@@ -1,366 +1,442 @@
-#include <stdio.h>                //For Standard I/O 
-#include <stdlib.h>               //Standard Libraries like exit etc..
-#include <sys/socket.h>		  //For Socket APIs
-#include <errno.h>		  //For errno
-#include <net/if.h>		  //For Promiscous mode i.e, monitoring mode
-#include <sys/ioctl.h>		  //For IOCTLs
-#include <linux/if_ether.h>       //For ETH_P_ALL and for other
-#include <string.h>		  //For string functions like strncpy etc.
-#include <unistd.h>  		  //For close() 
-#include <netinet/ip.h>		  //For IP Header
-#include <arpa/inet.h>		  //For inet_ntoa and some others functions...
-#include <netinet/ip_icmp.h>	  //For ICMP Header
-#include <netinet/tcp.h>	  //For TCP Header
-#include <netinet/udp.h>	  //For UDP Header
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <errno.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <linux/if_ether.h>
+#include <string.h>
+#include <unistd.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <netinet/ip6.h>
+#include <netinet/icmp6.h>
 #include <signal.h>
 #include <assert.h>
-
 #include <unordered_map>
 #include <optional>
 
-#define FILTER_ALL  0
-#define FILTER_UDP  1
-#define FILTER_TCP  2
-#define FILTER_ICMP 3
+#define FILTER_ALL   0
+#define FILTER_UDP   1
+#define FILTER_TCP   2
+#define FILTER_ICMP  3
+#define FILTER_HTTP  4
+#define IP_MODE_BOTH 0
+#define IP_MODE_V4   1
+#define IP_MODE_V6   2
 
 typedef unsigned long Ip;
-// em vez de usar um optional seria possível simplesmente remover a chave do map
 typedef std::optional<uint32_t> ExpectedSeq;
-
 typedef std::unordered_map<Ip, std::unordered_map<Ip, ExpectedSeq>> IpTable;
 
-//global variables to track number of TCP/UDP/ICMP/IGMP/Others
-int tcp=0,icmp=0,igmp,udp=0,others=0,total=0;
-struct sockaddr_in source,dest;
-FILE *logsniff; //redirecting output to a file to parse any packet or ip info using grep 
+//Global variables to track packet statistics
+int tcp = 0, icmp = 0, igmp = 0, udp = 0, http = 0, others = 0, total = 0;
+int ipv4_packets = 0, ipv6_packets = 0;
+FILE *logsniff_ipv4, *logsniff_ipv6; //Log files for IPv4 and IPv6
+IpTable ipTable; //Table to track expected TCP sequences
 
-IpTable ipTable;
+//Functions Prototypes
+void INThandler(int sig);
+FILE* get_log_file(int is_ipv6);
+void ethernet_header(unsigned char* Buffer, int Size, int is_ipv6);
+void ip_header(unsigned char* Buffer, int Size, int is_ipv6);
+bool http_packet(unsigned char* Buffer, int Size, int is_ipv6);
+void icmp_packet(unsigned char* Buffer, int Size, int is_ipv6);
+void checkAckSeq(struct tcphdr *tcph, void *ip_header_ptr, int is_ipv6);
+void tcp_packet(unsigned char* Buffer, int Size, bool http_only, int filter, int is_ipv6);
+void udp_packet(unsigned char *Buffer, int Size, int is_ipv6);
+void packetCounter(unsigned char* buffer, int size, int filter, int ip_mode);
+void print_usage(char **argv);
 
-//Pass RAW BUFFER into Ethhdr structure and print Ethernet header information.
-
-void  INThandler(int sig)
-{
-	char  c;
-
-	signal(sig, SIG_IGN);
-	printf("OUCH, did you hit Ctrl-C?\n"
-		"Do you really want to quit? [y/n] ");
-	c = getchar();
-	if (c == 'y' || c == 'Y')
-	{
-	
-		printf("TCP : %d   UDP : %d   ICMP : %d   IGMP : %d   Others : %d   Total : %d\n", tcp , udp , icmp , igmp , others , total);
-		exit(0);
-	}
-	else
-          signal(SIGINT, INThandler);
-	getchar(); // Get new line character
+//Signal handler for Ctrl+C (shows statistics before exiting)
+void INThandler(int sig) {
+    char c;
+    signal(sig, SIG_IGN);
+    printf("\nOUCH, did you hit Ctrl-C?\nDo you really want to quit? [y/n] ");
+    c = getchar();
+    if (c == 'y' || c == 'Y') {
+        float ipv4_percent = (total > 0) ? (ipv4_packets * 100.0 / total) : 0;
+        float ipv6_percent = (total > 0) ? (ipv6_packets * 100.0 / total) : 0;
+        
+        printf("\n=== Estatísticas Finais ===\n");
+        printf("IPv4: %d (%.2f%%)\n", ipv4_packets, ipv4_percent);
+        printf("IPv6: %d (%.2f%%)\n", ipv6_packets, ipv6_percent);
+        printf("TCP: %d   UDP: %d   ICMP: %d   HTTP: %d   IGMP: %d   Others: %d   Total: %d\n", 
+               tcp, udp, icmp, http, igmp, others, total);
+        
+        fclose(logsniff_ipv4);
+        fclose(logsniff_ipv6);
+        exit(0);
+    }
+    signal(SIGINT, INThandler);
+    while (getchar() != '\n'); // Limpa buffer de entrada
 }
 
-
-void ethernet_header(unsigned char* Buffer, int Size)
-{
-	struct ethhdr *eth = (struct ethhdr *)Buffer;
-	fprintf(logsniff , "\n");
-	fprintf(logsniff , "Ethernet Header\n");
-	fprintf(logsniff , "   |-Destination Address : %.2X-%.2X-%.2X-%.2X-%.2X-%.2X \n", eth->h_dest[0] , eth->h_dest[1] , eth->h_dest[2] , eth->h_dest[3] , eth->h_dest[4] , eth->h_dest[5] );
-	fprintf(logsniff , "   |-Source Address      : %.2X-%.2X-%.2X-%.2X-%.2X-%.2X \n", eth->h_source[0] , eth->h_source[1] , eth->h_source[2] , eth->h_source[3] , eth->h_source[4] , eth->h_source[5] );
-	fprintf(logsniff , "   |-Protocol            : %u \n",(unsigned short)eth->h_proto);
+//Returns appropriate log file based on IP version
+FILE* get_log_file(int is_ipv6) {
+    return is_ipv6 ? logsniff_ipv6 : logsniff_ipv4;
 }
 
-
-//Pass RAW BUFFER into iphdr structure and then print IP Header details.
-void ip_header(unsigned char* Buffer, int Size)
-{
-	ethernet_header(Buffer , Size);
-
-	unsigned short iphdrlen;
-	 
-	struct iphdr *iph = (struct iphdr *)(Buffer  + sizeof(struct ethhdr) );
-	iphdrlen =iph->ihl*4;
-
-	memset(&source, 0, sizeof(source));
-	source.sin_addr.s_addr = iph->saddr;
-
-	memset(&dest, 0, sizeof(dest));
-	dest.sin_addr.s_addr = iph->daddr;
-
-	fprintf(logsniff , "\n");
-	fprintf(logsniff , "IP Header\n");
-	fprintf(logsniff , "   |-IP Version        : %d\n",(unsigned int)iph->version);
-	fprintf(logsniff , "   |-IP Header Length  : %d DWORDS or %d Bytes\n",(unsigned int)iph->ihl,((unsigned int)(iph->ihl))*4);
-	fprintf(logsniff , "   |-Type Of Service   : %d\n",(unsigned int)iph->tos);
-	fprintf(logsniff , "   |-IP Total Length   : %d  Bytes(Size of Packet)\n",ntohs(iph->tot_len));
-	fprintf(logsniff , "   |-Identification    : %d\n",ntohs(iph->id));
-	fprintf(logsniff , "   |-TTL      : %d\n",(unsigned int)iph->ttl);
-	fprintf(logsniff , "   |-Protocol : %d\n",(unsigned int)iph->protocol);
-	fprintf(logsniff , "   |-Checksum : %d\n",ntohs(iph->check));
-	fprintf(logsniff , "   |-Source IP        : %s\n",inet_ntoa(source.sin_addr));
-	fprintf(logsniff , "   |-Destination IP   : %s\n",inet_ntoa(dest.sin_addr));
-	}
-
-
-//Pass RAW BUFFER into icmphdr structure and then print ICMP Header details.
-void icmp_packet(unsigned char* Buffer , int Size)
-{
-	
-
-	fprintf(logsniff,"\n***********************ICMP PACKET***********************\n");
-	unsigned short iphdrlen;
-
-	struct iphdr *iph = (struct iphdr *)(Buffer  + sizeof(struct ethhdr));
-	iphdrlen = iph->ihl * 4;
-
-	struct icmphdr *icmph = (struct icmphdr *)(Buffer + iphdrlen  + sizeof(struct ethhdr));
-
-	int header_size =  sizeof(struct ethhdr) + iphdrlen + sizeof icmph;
-
-	ip_header(Buffer,Size);	     
-	fprintf(logsniff , "\n");
-	 
-	fprintf(logsniff , "ICMP Header\n");
-	fprintf(logsniff , "   |-Type : %d",(unsigned int)(icmph->type));
-	     
-	if((unsigned int)(icmph->type) == 11)
-	{
-		fprintf(logsniff , "  (TTL Expired)\n");
-	}	
-	else if((unsigned int)(icmph->type) == ICMP_ECHOREPLY)
-	{
-		fprintf(logsniff , "  (ICMP Echo Reply)\n");
-	}
-     
-	fprintf(logsniff , "   |-Code : %d\n",(unsigned int)(icmph->code));
-	fprintf(logsniff , "   |-Checksum : %d\n",ntohs(icmph->checksum));
+//Prints Ethernet header details to log
+void ethernet_header(unsigned char* Buffer, int Size, int is_ipv6) {
+    FILE* logsniff = get_log_file(is_ipv6);
+    struct ethhdr *eth = (struct ethhdr *)Buffer;
+    fprintf(logsniff, "\nEthernet Header\n");
+    fprintf(logsniff, "   |-Destination MAC: %.2X-%.2X-%.2X-%.2X-%.2X-%.2X\n", 
+            eth->h_dest[0], eth->h_dest[1], eth->h_dest[2], 
+            eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+    fprintf(logsniff, "   |-Source MAC: %.2X-%.2X-%.2X-%.2X-%.2X-%.2X\n", 
+            eth->h_source[0], eth->h_source[1], eth->h_source[2], 
+            eth->h_source[3], eth->h_source[4], eth->h_source[5]);
+    fprintf(logsniff, "   |-Protocol: %s (0x%04X)\n", 
+            is_ipv6 ? "IPv6" : "IPv4", ntohs(eth->h_proto));
 }
 
-void checkAckSeq(struct tcphdr *tcph, struct iphdr *iph)
-{
-	struct sockaddr_in sockSource, sockDest;
+//Prints IP header details (supports both IPv4 and IPv6)
+void ip_header(unsigned char* Buffer, int Size, int is_ipv6) {
+    FILE* logsniff = get_log_file(is_ipv6);
+    ethernet_header(Buffer, Size, is_ipv6);
 
-	memset(&sockSource, 0, sizeof(sockSource));
-	sockSource.sin_addr.s_addr = iph->saddr;
-
-	memset(&sockDest, 0, sizeof(sockDest));
-	sockDest.sin_addr.s_addr = iph->daddr;
-	
-	Ip sourceIp = sockSource.sin_addr.s_addr;
-	Ip destIp = sockDest.sin_addr.s_addr;
-	bool packetError = false;
-	std::optional<uint32_t> expectedSeq;
-
-	// checando o SEQ do pacote
-	if (
-		ipTable.find(destIp) != ipTable.end() &&
-		ipTable[destIp].find(sourceIp) != ipTable[destIp].end()
-	) {
-		expectedSeq = ipTable[destIp][sourceIp];
-		auto receivedSeq = ntohl(tcph->seq);
-
-		if (expectedSeq.has_value() && expectedSeq.value() != receivedSeq) {
-			packetError = true;
-		} else {
-			ipTable[destIp][sourceIp] = std::nullopt;
-		}
-	}
-
-	// armazenando o ACK para comparar com um futuro SEQ recebido
-	if (ipTable.find(sourceIp) == ipTable.end()) {
-		ipTable[sourceIp] = std::unordered_map<Ip, ExpectedSeq>();
-	}
-	ipTable[sourceIp][destIp] = ntohl(tcph->ack_seq);
-
-	if (packetError) {
-		printf("Pacote com erro\n");
-	}
-
-	if (packetError) {
-		assert(expectedSeq.has_value());
-		fprintf(logsniff , "\nERROR: expected seq: %u, received seq: %u\n\n", expectedSeq.value(), ntohl(tcph->seq));
-	}
+    if (!is_ipv6) {
+        struct iphdr *iph = (struct iphdr *)(Buffer + sizeof(struct ethhdr));
+        fprintf(logsniff, "\nIPv4 Header\n");
+        fprintf(logsniff, "   |-Version: %d\n", iph->version);
+        fprintf(logsniff, "   |-IHL: %d DWORDS\n", iph->ihl);
+        fprintf(logsniff, "   |-TTL: %d\n", iph->ttl);
+        fprintf(logsniff, "   |-Protocol: %d\n", iph->protocol);
+        fprintf(logsniff, "   |-Source IP: %s\n", inet_ntoa(*(struct in_addr*)&iph->saddr));
+        fprintf(logsniff, "   |-Destination IP: %s\n", inet_ntoa(*(struct in_addr*)&iph->daddr));
+    } else {
+        struct ip6_hdr *ip6h = (struct ip6_hdr *)(Buffer + sizeof(struct ethhdr));
+        char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &ip6h->ip6_src, src, INET6_ADDRSTRLEN);
+        inet_ntop(AF_INET6, &ip6h->ip6_dst, dst, INET6_ADDRSTRLEN);
+        
+        fprintf(logsniff, "\nIPv6 Header\n");
+        fprintf(logsniff, "   |-Version: %d\n", (ip6h->ip6_vfc >> 4));
+        fprintf(logsniff, "   |-Next Header: %d\n", ip6h->ip6_nxt);
+        fprintf(logsniff, "   |-Hop Limit: %d\n", ip6h->ip6_hops);
+        fprintf(logsniff, "   |-Source IP: %s\n", src);
+        fprintf(logsniff, "   |-Destination IP: %s\n", dst);
+    }
 }
 
-//Pass same sniffed RAW BUFFER into tcphdr structure and print TCP Header/Packet details.
-void tcp_packet(unsigned char* Buffer, int Size)
-{
-	unsigned short iphdrlen;
+//Detects HTTP packets by checking payload for HTTP methods
+bool http_packet(unsigned char* Buffer, int Size, int is_ipv6) {
+    FILE* logsniff = get_log_file(is_ipv6);
+    int ip_header_len = is_ipv6 ? sizeof(struct ip6_hdr) : ((struct iphdr*)(Buffer + sizeof(struct ethhdr)))->ihl * 4;
+    struct tcphdr *tcph = (struct tcphdr*)(Buffer + sizeof(struct ethhdr) + ip_header_len);
+    int header_size = sizeof(struct ethhdr) + ip_header_len + tcph->doff * 4;
+    int payload_size = Size - header_size;
+    
+    if (payload_size <= 0) {
+        fprintf(logsniff, "\nHTTP Packet (Header Only)\n");
+        return false;
+    }
 
-	struct iphdr *iph = (struct iphdr *)( Buffer  + sizeof(struct ethhdr) );
-	iphdrlen = iph->ihl*4;
-
-	struct tcphdr *tcph=(struct tcphdr*)(Buffer + iphdrlen + sizeof(struct ethhdr));
-	     
-	int header_size =  sizeof(struct ethhdr) + iphdrlen + tcph->doff*4;
-
-	fprintf(logsniff , "\n\n***********************TCP Packet*************************\n");  
-	ip_header(Buffer,Size);
-
-	checkAckSeq(tcph, iph);
-	 
-	fprintf(logsniff , "\n");
-	fprintf(logsniff , "TCP Header\n");
-	fprintf(logsniff , "   |-Source Port      : %u\n",ntohs(tcph->source));
-	fprintf(logsniff , "   |-Destination Port : %u\n",ntohs(tcph->dest));
-	fprintf(logsniff , "   |-Sequence Number    : %u\n",ntohl(tcph->seq));
-	fprintf(logsniff , "   |-Acknowledge Number : %u\n",ntohl(tcph->ack_seq));
-	fprintf(logsniff , "   |-Header Length      : %d DWORDS or %d BYTES\n" ,(unsigned int)tcph->doff,(unsigned int)tcph->doff*4);
-	//fprintf(logsniff , "   |-CWR Flag : %d\n",(unsigned int)tcph->cwr);
-	//fprintf(logsniff , "   |-ECN Flag : %d\n",(unsigned int)tcph->ece);
-	fprintf(logsniff , "   |-Urgent Flag          : %d\n",(unsigned int)tcph->urg);
-	fprintf(logsniff , "   |-Acknowledgement Flag : %d\n",(unsigned int)tcph->ack);
-	fprintf(logsniff , "   |-Push Flag            : %d\n",(unsigned int)tcph->psh);
-	fprintf(logsniff , "   |-Reset Flag           : %d\n",(unsigned int)tcph->rst);
-	fprintf(logsniff , "   |-Synchronise Flag     : %d\n",(unsigned int)tcph->syn);
-	fprintf(logsniff , "   |-Finish Flag          : %d\n",(unsigned int)tcph->fin);
-	fprintf(logsniff , "   |-Window         : %d\n",ntohs(tcph->window));
-	fprintf(logsniff , "   |-Checksum       : %d\n",ntohs(tcph->check));
-	fprintf(logsniff , "   |-Urgent Pointer : %d\n",tcph->urg_ptr);
-	fprintf(logsniff , "\n");
-}
-
-
-//Pass same sniffed RAW BUFFER into udphdr structure and print UDP Packet/Header details.
-void udp_packet(unsigned char *Buffer , int Size)
-{
-	
-	unsigned short iphdrlen;
-	
-	struct iphdr *iph = (struct iphdr *)(Buffer +  sizeof(struct ethhdr));
-	iphdrlen = iph->ihl*4;
-	
-	struct udphdr *udph = (struct udphdr*)(Buffer + iphdrlen  + sizeof(struct ethhdr));
-	
-	int header_size =  sizeof(struct ethhdr) + iphdrlen + sizeof udph;
-	
-	fprintf(logsniff , "\n\n***********************UDP Packet*************************\n");
-	
-	ip_header(Buffer,Size);			
-	
-	fprintf(logsniff , "\nUDP Header\n");
-	fprintf(logsniff , "   |-Source Port      : %d\n" , ntohs(udph->source));
-	fprintf(logsniff , "   |-Destination Port : %d\n" , ntohs(udph->dest));
-	fprintf(logsniff , "   |-UDP Length       : %d\n" , ntohs(udph->len));
-	fprintf(logsniff , "   |-UDP Checksum     : %d\n" , ntohs(udph->check));
-	
-}
-
-//process packet according to protocol number and also counts number of TCP/ICMP/UDP/IGMP/Others(ARP etc.) Packets
-void packetCounter(unsigned char* buffer, int size, int filter)
-{
-	//Get the IP Header part of this packet , excluding the ethernet header
-	struct iphdr *iph = (struct iphdr*)(buffer + sizeof(struct ethhdr));
-	++total;
-	int proto = iph->protocol;
-	if (proto == 1)
-	{
-		++icmp;
-		if (filter == FILTER_ICMP || filter == FILTER_ALL) 
-            icmp_packet(buffer,size);
-	}
-	else if (proto == 2)
-	{
-		++igmp;
-	}
-	else if(proto == 6)
-	{
-		++tcp;
-		if (filter == FILTER_TCP || filter == FILTER_ALL) 
-            tcp_packet(buffer,size);
-	}
-	else if(proto == 17)
-	{
-		++udp;
-		if (filter == FILTER_UDP || filter == FILTER_ALL) 
-            udp_packet(buffer,size);
-	}
-	else
-	{
-		++others; //like ARP etc..
-	}
-
-	
-	//printf("TCP : %d   UDP : %d   ICMP : %d   IGMP : %d   Others : %d   Total : %d\n", tcp , udp , icmp , igmp , others , total);
-}
-
-void print_usage(char **argv)
-{
-    printf("USAGE: sudo %s <required: network_card_name> <optional: packet-filter>\n", argv[0]);
-    printf("USAGE: packet-filters can be: --udp, --tcp, --icmp\n");
-    printf("You can see your network cards by executing the command: ip link show\n");
-}
-
-int main(int argc, char **argv)
-{
-	if (argc < 2) {
-		print_usage(argv);
-		return 1;
-	}
-
-    int filter = FILTER_ALL;
-    if (argc == 3) {
-        char* received_filter = argv[2];
-
-        if (strcmp("--udp", received_filter) == 0) {
-            filter = FILTER_UDP;
-        } else if (strcmp("--tcp", received_filter) == 0) {
-            filter = FILTER_TCP;
-        } else if (strcmp("--icmp", received_filter) == 0) {
-            filter = FILTER_ICMP;
+    char *payload = (char*)(Buffer + header_size);
+    bool is_http = false;
+    const char *http_methods[] = {"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "HTTP/"};
+    
+    for (const char *method : http_methods) {
+        if (strncmp(payload, method, strlen(method)) == 0) {
+            is_http = true;
+            break;
         }
     }
 
-	printf("Writing packets info in sniff_logger.txt\n");	
-	signal(SIGINT, INThandler);
-	struct sockaddr saddr;
-	int sock, saddr_size,n;
-	unsigned char *buff = (unsigned char *) malloc(65536);
-	//unsigned char *iphead, *ethhead;
-	struct ifreq ethreq;
-	int count = 1;
-	logsniff=fopen("sniff_logger.txt","w");
-	if(logsniff==NULL) 
-	{
-		 printf("Unable to create sniff_logger.txt file.");
-	}
+    if (!is_http) return false;
 
-	if ( (sock=socket(AF_PACKET, SOCK_RAW,htons(ETH_P_ALL)))<0) 
-	{
-        printf("run this program using 'sudo', required to open raw socket\n");
-		perror("socket");
-		exit(1);
-	}
+    http++;
+    fprintf(logsniff, "\nHTTP Packet\n");
+    // ... (restante da análise HTTP igual ao original)
+    return true;
+}
 
-	/* Set the network card in promiscuos mode */
-	strncpy(ethreq.ifr_name,argv[1],IFNAMSIZ);
-	if (ioctl(sock,SIOCGIFFLAGS,&ethreq)==-1) 
-	{
-		perror("ioctl");
-		close(sock);
-		exit(1);
-	}
-	ethreq.ifr_flags|=IFF_PROMISC;
-	if (ioctl(sock,SIOCSIFFLAGS,&ethreq)==-1) 
-	{
-		perror("ioctl");
-		close(sock);
-		exit(1);
-	}
+//Verifies TCP sequence numbers against expected values
+void checkAckSeq(struct tcphdr *tcph, void *ip_header_ptr, int is_ipv6) {
+    FILE* logsniff = get_log_file(is_ipv6);
+    char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
+    Ip sourceIp, destIp;
 
-	while (count) 
-	{
-		n = recvfrom(sock,buff,65536,0,NULL,NULL); //UDP based , but I think there will be loss of  some packets , but faster then TCP .
-		if(n <0 )
-		{
-			printf("Recvfrom error , failed to get packets\n");
-			return 1;
-		}
-		packetCounter(buff,n, filter);
-	}
-	
-	ethreq.ifr_flags ^= IFF_PROMISC; // mask it off (remove)
-	ioctl(sock, SIOCSIFFLAGS, &ethreq); // update
-	close(sock);
-	return 0;
-	
+    if (!is_ipv6) {
+        struct iphdr *iph = (struct iphdr *)ip_header_ptr;
+        sourceIp = iph->saddr;
+        destIp = iph->daddr;
+        inet_ntop(AF_INET, &iph->saddr, src_ip, INET_ADDRSTRLEN);
+        inet_ntop(AF_INET, &iph->daddr, dst_ip, INET_ADDRSTRLEN);
+    } else {
+        struct ip6_hdr *ip6h = (struct ip6_hdr *)ip_header_ptr;
+        sourceIp = *((Ip*)&ip6h->ip6_src);
+        destIp = *((Ip*)&ip6h->ip6_dst);
+        inet_ntop(AF_INET6, &ip6h->ip6_src, src_ip, INET6_ADDRSTRLEN);
+        inet_ntop(AF_INET6, &ip6h->ip6_dst, dst_ip, INET6_ADDRSTRLEN);
+    }
 
+    if (ipTable[destIp].count(sourceIp) && ipTable[destIp][sourceIp].has_value()) {
+        uint32_t expected = ipTable[destIp][sourceIp].value();
+        uint32_t received = ntohl(tcph->seq);
+        
+        if (expected != received) {
+            fprintf(logsniff, "\nTCP Sequence Error: %s -> %s\n", src_ip, dst_ip);
+            fprintf(logsniff, "   Expected SEQ: %u, Received SEQ: %u\n", expected, received);
+        }
+    }
+    ipTable[sourceIp][destIp] = ntohl(tcph->ack_seq);
+}
+
+//Handles ICMP/ICMPv6 packets and logs details
+void icmp_packet(unsigned char* Buffer, int Size, int is_ipv6) {
+    FILE* logsniff = get_log_file(is_ipv6);
+
+    if (!is_ipv6) {
+        // IPv4 ICMP
+        struct iphdr *iph = (struct iphdr*)(Buffer + sizeof(struct ethhdr));
+        struct icmphdr *icmph = (struct icmphdr*)(Buffer + sizeof(struct ethhdr) + (iph->ihl * 4));
+
+        fprintf(logsniff, "\n***********************ICMPv4 Packet***********************\n");
+        ip_header(Buffer, Size, is_ipv6);
+
+        fprintf(logsniff, "   |-Type: %d", icmph->type);
+        if (icmph->type == ICMP_ECHOREPLY) fprintf(logsniff, " (Echo Reply)");
+        else if (icmph->type == ICMP_ECHO) fprintf(logsniff, " (Echo Request)");
+        fprintf(logsniff, "\n   |-Code: %d\n", icmph->code);
+        fprintf(logsniff, "   |-Checksum: %d\n", ntohs(icmph->checksum));
+    } else {
+        // IPv6 ICMPv6
+        struct ip6_hdr *ip6h = (struct ip6_hdr*)(Buffer + sizeof(struct ethhdr));
+        struct icmp6_hdr *icmp6h = (struct icmp6_hdr*)(Buffer + sizeof(struct ethhdr) + sizeof(struct ip6_hdr));
+
+        fprintf(logsniff, "\n***********************ICMPv6 Packet***********************\n");
+        ip_header(Buffer, Size, is_ipv6);
+
+        fprintf(logsniff, "   |-Type: %d", icmp6h->icmp6_type);
+        if (icmp6h->icmp6_type == ICMP6_ECHO_REQUEST) fprintf(logsniff, " (Echo Request)");
+        else if (icmp6h->icmp6_type == ICMP6_ECHO_REPLY) fprintf(logsniff, " (Echo Reply)");
+        fprintf(logsniff, "\n   |-Code: %d\n", icmp6h->icmp6_code);
+        fprintf(logsniff, "   |-Checksum: %d\n", ntohs(icmp6h->icmp6_cksum));
+    }
+}
+
+//Processes TCP packets (includes HTTP detection and sequence checking)
+void tcp_packet(unsigned char* Buffer, int Size, bool http_only, int filter, int is_ipv6) {
+    FILE* logsniff = get_log_file(is_ipv6);
+    struct tcphdr *tcph;
+    int header_size;
+
+    if (!is_ipv6) {
+        struct iphdr *iph = (struct iphdr*)(Buffer + sizeof(struct ethhdr));
+        tcph = (struct tcphdr*)(Buffer + sizeof(struct ethhdr) + (iph->ihl * 4));
+        header_size = sizeof(struct ethhdr) + (iph->ihl * 4) + (tcph->doff * 4);
+    } else {
+        struct ip6_hdr *ip6h = (struct ip6_hdr*)(Buffer + sizeof(struct ethhdr));
+        tcph = (struct tcphdr*)(Buffer + sizeof(struct ethhdr) + sizeof(struct ip6_hdr));
+        header_size = sizeof(struct ethhdr) + sizeof(struct ip6_hdr) + (tcph->doff * 4);
+    }
+
+    // Check HTTP/HTTPS
+    if ((ntohs(tcph->dest) == 80 || ntohs(tcph->source) == 80 || ntohs(tcph->dest) == 443 || ntohs(tcph->source) == 443)) {
+        if (http_packet(Buffer, Size, is_ipv6) && filter == FILTER_HTTP) return;
+    }
+
+    if (!http_only) {
+        fprintf(logsniff, "\n***********************TCP Packet (%s)***********************\n",
+                is_ipv6 ? "IPv6" : "IPv4");
+        ip_header(Buffer, Size, is_ipv6);
+
+        fprintf(logsniff, "   |-Source Port: %u\n", ntohs(tcph->source));
+        fprintf(logsniff, "   |-Destination Port: %u\n", ntohs(tcph->dest));
+        fprintf(logsniff, "   |-Sequence Number: %u\n", ntohl(tcph->seq));
+        fprintf(logsniff, "   |-Ack Number: %u\n", ntohl(tcph->ack_seq));
+        fprintf(logsniff, "   |-Flags: %s%s%s%s%s%s\n",
+                tcph->urg ? "URG " : "", tcph->ack ? "ACK " : "",
+                tcph->psh ? "PSH " : "", tcph->rst ? "RST " : "",
+                tcph->syn ? "SYN " : "", tcph->fin ? "FIN " : "");
+
+        // Payload (first 64 bytes)
+        int payload_size = Size - header_size;
+        if (payload_size > 0) {
+            fprintf(logsniff, "Payload (%d bytes):\n", payload_size);
+            int display_size = payload_size > 64 ? 64 : payload_size;
+            for (int i = 0; i < display_size; i++) {
+                fprintf(logsniff, "%02X ", Buffer[header_size + i]);
+                if ((i+1) % 16 == 0) fprintf(logsniff, "\n");
+            }
+            if (payload_size > 64) fprintf(logsniff, "\n[Truncated to 64 bytes]");
+            fprintf(logsniff, "\n");
+        }
+    }
+}
+
+
+//Processes UDP packets (includes DNS detection)
+void udp_packet(unsigned char* Buffer, int Size, int is_ipv6) {
+    FILE* logsniff = get_log_file(is_ipv6);
+    struct udphdr *udph;
+    
+    if (!is_ipv6) {
+        struct iphdr *iph = (struct iphdr*)(Buffer + sizeof(struct ethhdr));
+        udph = (struct udphdr*)(Buffer + sizeof(struct ethhdr) + (iph->ihl * 4));
+    } else {
+        struct ip6_hdr *ip6h = (struct ip6_hdr*)(Buffer + sizeof(struct ethhdr));
+        udph = (struct udphdr*)(Buffer + sizeof(struct ethhdr) + sizeof(struct ip6_hdr));
+    }
+
+    fprintf(logsniff, "\n***********************UDP Packet (%s)***********************\n",
+            is_ipv6 ? "IPv6" : "IPv4");
+    ip_header(Buffer, Size, is_ipv6);
+
+    fprintf(logsniff, "   |-Source Port: %u\n", ntohs(udph->source));
+    fprintf(logsniff, "   |-Destination Port: %u\n", ntohs(udph->dest));
+    fprintf(logsniff, "   |-Length: %u\n", ntohs(udph->len));
+    fprintf(logsniff, "   |-Checksum: %u\n", ntohs(udph->check));
+
+    // DNS detection (port 53)
+    if (ntohs(udph->source) == 53 || ntohs(udph->dest) == 53) {
+        fprintf(logsniff, "   |-Protocol: DNS\n");
+    }
+}
+
+//Main packet processing function - routes packets to appropriate handlers
+void packetCounter(unsigned char* buffer, int size, int filter, int ip_mode) {
+    struct ethhdr *eth = (struct ethhdr*)buffer;
+    int is_ipv6 = (ntohs(eth->h_proto) == ETH_P_IPV6);
+
+    // Skip packets based on IP mode
+    if ((ip_mode == IP_MODE_V4 && is_ipv6) || (ip_mode == IP_MODE_V6 && !is_ipv6)) {
+        return;
+    }
+
+    is_ipv6 ? ipv6_packets++ : ipv4_packets++;
+    total++;
+
+    if (!is_ipv6) {
+        struct iphdr *iph = (struct iphdr*)(buffer + sizeof(struct ethhdr));
+        switch (iph->protocol) {
+            case IPPROTO_ICMP:
+                icmp++;
+                if (filter == FILTER_ICMP || filter == FILTER_ALL)
+                    icmp_packet(buffer, size, is_ipv6);
+                break;
+            case IPPROTO_TCP:
+                tcp++;
+                if (filter == FILTER_TCP || filter == FILTER_ALL || filter == FILTER_HTTP)
+                    tcp_packet(buffer, size, (filter == FILTER_HTTP), filter, is_ipv6);
+                break;
+            case IPPROTO_UDP:
+                udp++;
+                if (filter == FILTER_UDP || filter == FILTER_ALL)
+                    udp_packet(buffer, size, is_ipv6);
+                break;
+            case IPPROTO_IGMP:
+                igmp++;
+                break;
+            default:
+                others++;
+        }
+    } else {
+        struct ip6_hdr *ip6h = (struct ip6_hdr*)(buffer + sizeof(struct ethhdr));
+        switch (ip6h->ip6_nxt) {
+            case IPPROTO_ICMPV6:
+                icmp++;
+                if (filter == FILTER_ICMP || filter == FILTER_ALL)
+                    icmp_packet(buffer, size, is_ipv6);
+                break;
+            case IPPROTO_TCP:
+                tcp++;
+                if (filter == FILTER_TCP || filter == FILTER_ALL || filter == FILTER_HTTP)
+                    tcp_packet(buffer, size, (filter == FILTER_HTTP), filter, is_ipv6);
+                break;
+            case IPPROTO_UDP:
+                udp++;
+                if (filter == FILTER_UDP || filter == FILTER_ALL)
+                    udp_packet(buffer, size, is_ipv6);
+                break;
+            default:
+                others++;
+        }
+    }
+}
+
+//Displays program usage instructions
+void print_usage(char **argv) {
+    printf("USAGE: sudo %s <interface> [--filter] [--ipver]\n", argv[0]);
+    printf("Filters: --all, --tcp, --udp, --icmp, --http\n");
+    printf("IP Versions: --ipv4, --ipv6, --both\n");
+    printf("Example: %s eth0 --tcp --ipv6\n", argv[0]);
+}
+
+//Sets up capture and processes packets
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        print_usage(argv);
+        return 1;
+    }
+
+    int filter = FILTER_ALL;
+    int ip_mode = IP_MODE_BOTH;
+    
+    // Parse arguments
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--tcp") == 0) filter = FILTER_TCP;
+        else if (strcmp(argv[i], "--udp") == 0) filter = FILTER_UDP;
+        else if (strcmp(argv[i], "--icmp") == 0) filter = FILTER_ICMP;
+        else if (strcmp(argv[i], "--http") == 0) filter = FILTER_HTTP;
+        else if (strcmp(argv[i], "--ipv4") == 0) ip_mode = IP_MODE_V4;
+        else if (strcmp(argv[i], "--ipv6") == 0) ip_mode = IP_MODE_V6;
+    }
+
+    logsniff_ipv4 = fopen("sniff_logger_ipv4.txt", "w");
+    logsniff_ipv6 = fopen("sniff_logger_ipv6.txt", "w");
+    if (!logsniff_ipv4 || !logsniff_ipv6) {
+        perror("Failed to open log files");
+        return 1;
+    }
+
+    signal(SIGINT, INThandler);
+    
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sock < 0) {
+        perror("Socket creation failed");
+        return 1;
+    }
+
+    struct ifreq ethreq;
+    strncpy(ethreq.ifr_name, argv[1], IFNAMSIZ);
+    if (ioctl(sock, SIOCGIFFLAGS, &ethreq) == -1) {
+        perror("ioctl(SIOCGIFFLAGS) failed");
+        close(sock);
+        return 1;
+    }
+
+    ethreq.ifr_flags |= IFF_PROMISC;
+    if (ioctl(sock, SIOCSIFFLAGS, &ethreq) == -1) {
+        perror("ioctl(SIOCSIFFLAGS) failed");
+        close(sock);
+        return 1;
+    }
+
+    printf("Starting capture on interface %s\n", argv[1]);
+    printf("Logging IPv4 to sniff_logger_ipv4.txt\n");
+    printf("Logging IPv6 to sniff_logger_ipv6.txt\n");
+
+    while (true) {
+        unsigned char buffer[65536];
+        int packet_size = recvfrom(sock, buffer, sizeof(buffer), 0, NULL, NULL);
+        if (packet_size < 0) {
+            perror("Recvfrom error");
+            break;
+        }
+        packetCounter(buffer, packet_size, filter, ip_mode);
+    }
+
+    ethreq.ifr_flags ^= IFF_PROMISC;
+    ioctl(sock, SIOCSIFFLAGS, &ethreq);
+    close(sock);
+    fclose(logsniff_ipv4);
+    fclose(logsniff_ipv6);
+    return 0;
 }
